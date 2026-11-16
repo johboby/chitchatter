@@ -1,0 +1,291 @@
+import { describe, expect, it, vi } from 'vitest'
+
+import {
+  applyFileOffer,
+  FileHandle,
+  FileOffers,
+  generateFileKey,
+  getInlineMediaFiles,
+  isEveryFileInlineMedia,
+  isInlineMediaFile,
+  isOfferedByAnotherPeer,
+  removeFileOffer,
+  shouldRescindOffer,
+} from 'core/chat/fileOffers'
+import {
+  FILE_KEY_BYTE_LENGTH,
+  FileOfferMetadata,
+  isFileKey,
+} from 'core/models/chat'
+
+const fileKey = generateFileKey()
+
+const file = (name: string, type: string): FileHandle => ({
+  name,
+  type,
+  size: 1,
+})
+
+describe('isInlineMediaFile', () => {
+  it.each([
+    ['image/png', true],
+    ['image/svg+xml', false],
+    ['IMAGE/SVG+XML', false],
+    ['image/svg+xml; charset=utf-8', false],
+    ['audio/mpeg', true],
+    ['video/mp4', true],
+    ['application/pdf', false],
+    ['text/plain', false],
+    ['', false],
+  ])('treats %s as inline media: %s', (type, expected) => {
+    expect(isInlineMediaFile(file('f', type))).toBe(expected)
+  })
+
+  it('does not treat an SVG as inline media, so it is shared as a download', () => {
+    expect(isEveryFileInlineMedia([file('poc.svg', 'image/svg+xml')])).toBe(
+      false
+    )
+  })
+})
+
+describe('isEveryFileInlineMedia', () => {
+  it('is true when every file is inline media', () => {
+    expect(
+      isEveryFileInlineMedia([file('a', 'image/png'), file('b', 'video/mp4')])
+    ).toBe(true)
+  })
+
+  it('is false when any file is not', () => {
+    expect(
+      isEveryFileInlineMedia([
+        file('a', 'image/png'),
+        file('b', 'application/zip'),
+      ])
+    ).toBe(false)
+  })
+
+  it('is false for an empty, null or undefined list', () => {
+    expect(isEveryFileInlineMedia([])).toBe(false)
+    expect(isEveryFileInlineMedia(null)).toBe(false)
+    expect(isEveryFileInlineMedia(undefined)).toBe(false)
+  })
+})
+
+describe('getInlineMediaFiles', () => {
+  it('keeps only the inline media files', () => {
+    expect(
+      getInlineMediaFiles([
+        file('a', 'image/png'),
+        file('b', 'application/zip'),
+        file('c', 'audio/ogg'),
+      ]).map(({ name }) => name)
+    ).toEqual(['a', 'c'])
+  })
+})
+
+describe('generateFileKey', () => {
+  it('produces a key that passes the wire validator', () => {
+    expect(isFileKey(generateFileKey())).toBe(true)
+  })
+
+  it('encodes FILE_KEY_BYTE_LENGTH bytes as unpadded base64url', () => {
+    const key = generateFileKey()
+
+    expect(key).toMatch(/^[A-Za-z0-9_-]+$/)
+    expect(key).not.toContain('=')
+
+    const base64 = key.replace(/-/g, '+').replace(/_/g, '/')
+
+    expect(atob(base64)).toHaveLength(FILE_KEY_BYTE_LENGTH)
+  })
+
+  it('makes 256-bit keys', () => {
+    // Pinned, so that shrinking the key is a decision someone makes on purpose
+    expect(FILE_KEY_BYTE_LENGTH * 8).toBe(256)
+    expect(generateFileKey()).toHaveLength(43)
+  })
+
+  it('uses the platform CSPRNG', () => {
+    const getRandomValues = vi.spyOn(globalThis.crypto, 'getRandomValues')
+
+    generateFileKey()
+
+    expect(getRandomValues).toHaveBeenCalledOnce()
+    getRandomValues.mockRestore()
+  })
+
+  it('never repeats a key', () => {
+    const keys = new Set(Array.from({ length: 1000 }, generateFileKey))
+
+    expect(keys.size).toBe(1000)
+  })
+})
+
+describe('applyFileOffer / removeFileOffer', () => {
+  const metadata: FileOfferMetadata = {
+    magnetURI: 'magnet:a',
+    fileKey,
+    isAllInlineMedia: false,
+  }
+
+  it('records an offer against its peer', () => {
+    expect(applyFileOffer({}, 'peer-1', metadata)).toEqual({
+      'peer-1': metadata,
+    })
+  })
+
+  it('replaces an existing offer from the same peer', () => {
+    const replacement: FileOfferMetadata = {
+      magnetURI: 'magnet:b',
+      fileKey,
+      isAllInlineMedia: true,
+    }
+
+    expect(
+      applyFileOffer({ 'peer-1': metadata }, 'peer-1', replacement)
+    ).toEqual({ 'peer-1': replacement })
+  })
+
+  it('does not mutate the offers it is given', () => {
+    const offers = { 'peer-1': metadata }
+
+    applyFileOffer(offers, 'peer-2', metadata)
+    removeFileOffer(offers, 'peer-1')
+
+    expect(offers).toEqual({ 'peer-1': metadata })
+  })
+
+  it('removes an offer and ignores an unknown peer', () => {
+    expect(removeFileOffer({ 'peer-1': metadata }, 'peer-1')).toEqual({})
+    expect(removeFileOffer({ 'peer-1': metadata }, 'nobody')).toEqual({
+      'peer-1': metadata,
+    })
+  })
+})
+
+describe('shouldRescindOffer', () => {
+  const isOffering = vi.fn(() => true)
+  const notProtected = () => false
+
+  it('rescinds a non-inline offer that is still being seeded', () => {
+    expect(
+      shouldRescindOffer(
+        { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: false },
+        isOffering,
+        notProtected
+      )
+    ).toBe(true)
+  })
+
+  it('spares an all-inline-media offer, which stays reachable in the transcript', () => {
+    expect(
+      shouldRescindOffer(
+        { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: true },
+        isOffering,
+        notProtected
+      )
+    ).toBe(false)
+  })
+
+  it('spares a protected magnet even when the peer says it is not inline media', () => {
+    // The flag is written by the withdrawing peer, so it cannot be what keeps
+    // the receiver's own files and transcript media alive.
+    expect(
+      shouldRescindOffer(
+        { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: false },
+        isOffering,
+        magnetURI => magnetURI === 'magnet:a'
+      )
+    ).toBe(false)
+  })
+
+  it('does nothing when the offer is not being seeded', () => {
+    expect(
+      shouldRescindOffer(
+        { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: false },
+        () => false,
+        notProtected
+      )
+    ).toBe(false)
+  })
+
+  it('tolerates a missing offer', () => {
+    expect(shouldRescindOffer(null, isOffering, notProtected)).toBe(false)
+    expect(shouldRescindOffer(undefined, isOffering, notProtected)).toBe(false)
+  })
+})
+
+describe('isOfferedByAnotherPeer', () => {
+  const offers: FileOffers = {
+    'peer-1': { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: false },
+    'peer-2': { magnetURI: 'magnet:b', fileKey, isAllInlineMedia: false },
+  }
+
+  it('is false when only the peer itself offers the magnet', () => {
+    expect(isOfferedByAnotherPeer(offers, 'peer-1', 'magnet:a')).toBe(false)
+  })
+
+  it('is true when a different peer offers the same magnet', () => {
+    expect(
+      isOfferedByAnotherPeer(
+        {
+          ...offers,
+          'peer-3': { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: false },
+        },
+        'peer-1',
+        'magnet:a'
+      )
+    ).toBe(true)
+  })
+
+  it('judges each magnet on its own', () => {
+    expect(isOfferedByAnotherPeer(offers, 'peer-1', 'magnet:b')).toBe(true)
+    expect(isOfferedByAnotherPeer(offers, 'peer-1', 'magnet:z')).toBe(false)
+  })
+
+  it('is false when nobody offers anything', () => {
+    expect(isOfferedByAnotherPeer({}, 'peer-1', 'magnet:a')).toBe(false)
+  })
+})
+
+describe('the offers snapshot type', () => {
+  it('rejects a write at compile time', () => {
+    // Each `@ts-expect-error` below *is* the assertion: `tsc` fails on an
+    // unused directive, so dropping the `Readonly` breaks the build. It
+    // matters because `ChatRoom.getFileOffers` hands this very object out, and
+    // writing into it changes core state without the event subscribers re-read
+    // on — the reference does not change, so nothing re-renders.
+    const offers: FileOffers = {
+      'peer-1': { magnetURI: 'magnet:a', fileKey, isAllInlineMedia: false },
+    }
+
+    // @ts-expect-error — a snapshot is not a place to add an offer
+    offers['peer-2'] = {
+      magnetURI: 'magnet:b',
+      fileKey,
+      isAllInlineMedia: false,
+    }
+
+    // @ts-expect-error — nor to replace one
+    offers['peer-1'] = {
+      magnetURI: 'magnet:c',
+      fileKey,
+      isAllInlineMedia: true,
+    }
+
+    // `readonly` leaves no runtime trace, so both writes above really land —
+    // which is the point: the compiler is the only thing standing between a
+    // consumer and the room's own state, so the type has to carry it.
+    expect(Object.keys(offers)).toEqual(['peer-1', 'peer-2'])
+  })
+
+  it('hands a File[] back to a caller that passed File[]', () => {
+    // No assertion needed at the call site: the generic parameter carries the
+    // caller's own file type through, so a web caller holding real `File`s
+    // does not have to widen the core's structural `FileHandle` back.
+    const files = [file('a.png', 'image/png'), file('b.pdf', 'application/pdf')]
+    const inline: FileHandle[] = getInlineMediaFiles(files)
+
+    expect(inline).toEqual([files[0]])
+  })
+})

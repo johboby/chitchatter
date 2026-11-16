@@ -1,0 +1,211 @@
+import CloseIcon from '@mui/icons-material/Close'
+import Box from '@mui/material/Box'
+import ButtonBase from '@mui/material/ButtonBase'
+import CircularProgress from '@mui/material/CircularProgress'
+import Dialog from '@mui/material/Dialog'
+import IconButton from '@mui/material/IconButton'
+import Typography from '@mui/material/Typography'
+import { useContext, useEffect, useState } from 'react'
+import { TorrentFile } from 'webtorrent'
+
+import { RoomContext } from 'contexts/RoomContext'
+import { FileReference } from 'core/models/chat'
+
+import {
+  InlineMediaDownload,
+  InlineMediaDownloadState,
+  InlineMediaFile,
+  useInlineMediaDownload,
+} from './useInlineMediaDownload'
+
+type InlineMediaProps = FileReference
+
+interface InlineFileProps {
+  file: InlineMediaFile
+}
+
+const thumbnailMaxHeight = '300px'
+
+// Twice the default MUI Dialog margin (32px), so the full-size image never
+// touches the edges of the viewport.
+const imagePreviewViewportInset = '64px'
+
+// NOTE: These filename extensions are based on render-media, the upstream
+// library used to embed media files:
+// https://github.com/feross/render-media/blob/a445b2ab90fcd4a248552d32027b2bc6a02600c8/index.js#L15-L72
+//
+// SECURITY: This is an allowlist of inert raster formats, and it must stay
+// one. Files come from untrusted peers and their blob URLs live in the app's
+// own origin, so a format that can carry script runs with full access to the
+// app's storage when the user opens the image in its own tab. That is why
+// `.svg` (and `.html`, `.xml`, `.pdf`, ...) is deliberately absent: such files
+// are treated like any other non-previewable file instead.
+const supportedImageExtensions = ['.bmp', '.gif', '.jpeg', '.jpg', '.png']
+
+const supportedAudioExtensions = ['.aac', '.oga', '.ogg', '.wav', '.flac']
+
+const supportedMediaExtensions = [
+  ...supportedImageExtensions,
+  ...supportedAudioExtensions,
+]
+
+// Matches render-media's MAX_BLOB_LENGTH, which this component used to
+// inherit through appendTo
+const maxInlineMediaBytes = 200 * 1000 * 1000
+
+const useBlobUrl = (
+  file: Pick<TorrentFile, 'getBlobURL'>,
+  isEnabled: boolean
+) => {
+  const [url, setUrl] = useState<string>()
+  const [didFail, setDidFail] = useState(false)
+
+  useEffect(() => {
+    if (!isEnabled) return undefined
+
+    let isCurrent = true
+    let blobUrl: string | undefined
+
+    file.getBlobURL((err, createdUrl) => {
+      if (err || !createdUrl) {
+        if (isCurrent) setDidFail(true)
+        return
+      }
+
+      // The component went away while the blob was being built
+      if (!isCurrent) {
+        URL.revokeObjectURL(createdUrl)
+        return
+      }
+
+      blobUrl = createdUrl
+      setUrl(createdUrl)
+    })
+
+    return () => {
+      isCurrent = false
+
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+    }
+  }, [file, isEnabled])
+
+  return { url, didFail }
+}
+
+export const InlineFile = ({ file }: InlineFileProps) => {
+  const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false)
+
+  const { name } = file
+  const fileNameExtension = `.${name.split('.').pop() ?? ''}`
+  const isImage = supportedImageExtensions.includes(fileNameExtension)
+  const isMediaSupported =
+    supportedMediaExtensions.includes(fileNameExtension) &&
+    file.length <= maxInlineMediaBytes
+
+  const { url, didFail } = useBlobUrl(file, isMediaSupported)
+
+  if (!isMediaSupported) {
+    return (
+      <Typography sx={{ fontStyle: 'italic' }}>
+        Media preview not supported
+      </Typography>
+    )
+  }
+
+  if (didFail) {
+    return (
+      <Typography sx={{ fontStyle: 'italic' }}>
+        Media failed to render
+      </Typography>
+    )
+  }
+
+  if (!url) return null
+
+  if (!isImage) return <audio controls src={url} />
+
+  return (
+    <>
+      <ButtonBase
+        onClick={() => setIsImagePreviewOpen(true)}
+        aria-label={`View ${name} full size`}
+        sx={{ cursor: 'zoom-in' }}
+      >
+        <Box
+          component="img"
+          src={url}
+          alt={name}
+          sx={{ maxWidth: '100%', maxHeight: thumbnailMaxHeight }}
+        />
+      </ButtonBase>
+      <Dialog
+        open={isImagePreviewOpen}
+        onClose={() => setIsImagePreviewOpen(false)}
+        maxWidth={false}
+        // MUI puts aria-label on the wrapper, so it goes on the paper, which
+        // has role="dialog"
+        PaperProps={{ 'aria-label': `${name} preview` }}
+      >
+        <IconButton
+          aria-label="close"
+          onClick={() => setIsImagePreviewOpen(false)}
+          sx={{ position: 'absolute', right: 8, top: 8 }}
+        >
+          <CloseIcon />
+        </IconButton>
+        <Box
+          component="img"
+          src={url}
+          alt={name}
+          sx={{
+            display: 'block',
+            maxWidth: `calc(100vw - ${imagePreviewViewportInset})`,
+            maxHeight: `calc(100vh - ${imagePreviewViewportInset})`,
+          }}
+        />
+      </Dialog>
+    </>
+  )
+}
+
+export const InlineMedia = ({ magnetURI, fileKey }: InlineMediaProps) => {
+  const {
+    fileTransferService: { fileTransfer },
+  } = useContext(RoomContext)
+
+  return (
+    <InlineMediaView
+      download={useInlineMediaDownload(fileTransfer, { magnetURI, fileKey })}
+    />
+  )
+}
+
+interface InlineMediaViewProps {
+  download: InlineMediaDownload
+}
+
+/** What a message shows for each stage of its media's download. */
+export const InlineMediaView = ({ download }: InlineMediaViewProps) => {
+  switch (download.state) {
+    case InlineMediaDownloadState.LOADING:
+      return <CircularProgress variant="indeterminate" color="inherit" />
+
+    case InlineMediaDownloadState.FAILED:
+      return (
+        <Typography sx={{ fontStyle: 'italic' }}>
+          Media failed to load
+        </Typography>
+      )
+
+    case InlineMediaDownloadState.READY:
+      return (
+        <>
+          {/* A share can hold two files with the same name, so the name
+              alone is not a unique key. The list never reorders. */}
+          {download.files.map((file, index) => (
+            <InlineFile file={file} key={`${index}-${file.name}`} />
+          ))}
+        </>
+      )
+  }
+}
